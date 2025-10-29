@@ -1,0 +1,101 @@
+% 用于LSTM，提取若干点在807个台风过程的波高、增水、海流信息
+% 输出矩阵n*4*7*807，
+% n为坐标点，
+% 4为变量，分别为潮、流、浪、风，
+% 7为时间
+% 807为台风数
+
+
+clc
+clear
+close all
+
+% 读取fvcom网格
+[node, ~] = f_getNODEandELE(1,"F:/20241105TimeDifferenceOfWindsTidesAndWaves/datas/fort.grd");
+lon = node(:,2);
+lat = node(:,3);
+
+% 绘图坐标点
+space_step = 0.2;
+% space_step = 0.1;
+x=105.3: space_step: 116; y=12:space_step:23;
+[X,Y] = meshgrid(x, y);
+% 网格1维化
+LonRegion = reshape(X, [length(x)*length(y),1]);
+LatRegion = reshape(Y, [length(x)*length(y),1]);
+% 网格点
+Position = [LonRegion, LatRegion];
+% Position = [111 18.5];
+% 查找索引
+PositionIndex = f_findPosition(Position, node(:,2), node(:,3));
+
+%% mat文件
+ZetaList = dir("F:/20241105TimeDifferenceOfWindsTidesAndWaves/datas/zeta/*.mat");
+UTopList = dir("F:/20241105TimeDifferenceOfWindsTidesAndWaves/datas/u_top/*.mat");
+VTopList = dir("F:/20241105TimeDifferenceOfWindsTidesAndWaves/datas/v_top/*.mat");
+HsigList = dir("F:/20241105TimeDifferenceOfWindsTidesAndWaves/datas/hsig/*.mat");
+UWindList = dir("F:/20241105TimeDifferenceOfWindsTidesAndWaves/datas/u_wind/*.mat");
+VWindList = dir("F:/20241105TimeDifferenceOfWindsTidesAndWaves/datas/v_wind/*.mat");
+
+% 编号
+load("F:/20241105TimeDifferenceOfWindsTidesAndWaves/datas/Id.mat")
+% 提取热带气旋场次
+TCID = unique(Id);
+
+% 预设阈值
+Surge = cell(1, length(TCID)); Current = Surge; Wave = Surge; Wind = Surge;
+% % 逐个计算最大风潮、流、浪的时间差和比例
+for tc_i = 1: length(TCID)
+    % TC场次
+    tc_id = TCID(tc_i);
+    fprintf("%6d 进度: %3d / %3d \n", tc_id, tc_i, length(TCID))
+
+    disp('读取数据')
+    % 浪
+    % 利用浪中有数据是nan的特性
+    load(strcat(HsigList(tc_i).folder,'\',HsigList(tc_i).name));
+    WaveHeight_t = var_mat(PositionIndex, :);
+    % 潮
+    load(strcat(ZetaList(tc_i).folder,'\',ZetaList(tc_i).name));
+    Surge_t = var_mat(PositionIndex, :);
+    % Surge_t(abs(Surge_t)>5)=nan;
+    % 流
+    load(strcat(UTopList(tc_i).folder,'\',UTopList(tc_i).name));
+    utop = var_mat(PositionIndex, :);
+    load(strcat(VTopList(tc_i).folder,'\',VTopList(tc_i).name));
+    vtop = var_mat(PositionIndex, :);
+    CurrentVelocity_top_t = utop - 1i*vtop;
+    % 风
+    load(strcat(UWindList(tc_i).folder,'\',UWindList(tc_i).name));
+    uwind = var_mat(PositionIndex, :);
+    load(strcat(VWindList(tc_i).folder,'\',VWindList(tc_i).name));
+    vwind = var_mat(PositionIndex, :);
+    WindSpeed_t = uwind - 1i*vwind;
+
+    % 潮在计算过程中可能出现发散问题，导致增水计算提前终止，因此增水的列数可能少
+    % 下面代码块的功能是使潮、流、浪、风的时间长度相同
+    % 注意增水和流是一起计算的，因此流的时间长度应该和增水相同
+    time_length = min([size(Surge_t,2), size(CurrentVelocity_top_t,2), size(WaveHeight_t,2), size(WindSpeed_t,2)]);
+    WaveHeight_t = WaveHeight_t(:, 1: time_length);
+    Surge_t = Surge_t(:, 1: time_length) + WaveHeight_t - WaveHeight_t;
+    CurrentVelocity_top_t = CurrentVelocity_top_t(:, 1: time_length) + WaveHeight_t - WaveHeight_t + 1i*WaveHeight_t - 1i*WaveHeight_t;
+    WindSpeed_t = WindSpeed_t(:, 1: time_length) + WaveHeight_t - WaveHeight_t + 1i*WaveHeight_t - 1i*WaveHeight_t;
+
+
+    % 提取对应tc的潮、流、浪、风数据
+    % info_size_t = size(Surge_t,2);
+    % info_index_t = round(linspace(1, info_size_t, 7));
+
+    % Environment(1,tc_i,:,:) = Surge_t(PositionIndex, info_index_t);
+    % Environment(2,tc_i,:,:) = CurrentVelocity_top_t(PositionIndex, info_index_t);
+    % Environment(3,tc_i,:,:) = WaveHeight_t(PositionIndex, info_index_t);
+    % Environment(4,tc_i,:,:) = WindSpeed_t(PositionIndex, info_index_t);
+    Surge{tc_i} = Surge_t';
+    Current{tc_i} = CurrentVelocity_top_t';
+    Wave{tc_i} = WaveHeight_t';
+    Wind{tc_i} = WindSpeed_t';
+
+    disp('================================')
+end
+
+save("../datas/Environment_0_2.mat", 'Surge','Current','Wave','Wind', '-mat')
