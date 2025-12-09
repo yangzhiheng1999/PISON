@@ -73,14 +73,14 @@ for tc_i = 1: length(TCID)
     load(strcat(VTopList(tc_i).folder,'\',VTopList(tc_i).name));
     vtop = var_mat(PositionIndex, :);
     CurrentVelocity_top_t = utop - 1i*vtop;
-    CurrentVelocity_top_t(isLand, :) = nan;
+    CurrentVelocity_top_t(isLand) = nan;
     % 风
     load(strcat(UWindList(tc_i).folder,'\',UWindList(tc_i).name));
     uwind = var_mat(PositionIndex, :);
     load(strcat(VWindList(tc_i).folder,'\',VWindList(tc_i).name));
     vwind = var_mat(PositionIndex, :);
     WindSpeed_t = uwind - 1i*vwind;
-    WindSpeed_t(isLand, :) = nan;
+    WindSpeed_t(isLand) = nan;
 
     % 潮在计算过程中可能出现发散问题，导致增水计算提前终止，因此增水的列数可能少
     % 下面代码块的功能是使潮、流、浪、风的时间长度相同
@@ -95,7 +95,7 @@ for tc_i = 1: length(TCID)
     CurrentVelocity_top_t = CurrentVelocity_top_t(:, 2: time_length);
     WindSpeed_t = WindSpeed_t(:, 2: time_length);
 
-    % f_plotMap(X, Y, reshape(abs(Surge_t(:, 23)), size(X)), [0,1], 'plot_land','no')
+    f_plotMap(X, Y, reshape(abs(CurrentVelocity_top_t(:, 23), 'omitnan'), size(X)), [0,1], 'plot_land','no')
 
 
     % 提取对应tc的潮、流、浪、风数据
@@ -104,10 +104,10 @@ for tc_i = 1: length(TCID)
     Wave{tc_i} = WaveHeight_t';
     Wind{tc_i} = WindSpeed_t';
 
-    Id = [Id; repmat(tc_id, time_length-1, 1)];
+    % Id = [Id; repmat(tc_id, time_length, 1)];
 
     disp('================================')
 end
 
-save("../datas/Environment_64.mat", 'Surge','Current','Wave','Wind', '-mat')
-save("../datas/Id.mat", 'Id')
+save("../datas/Environment_0_2.mat", 'Surge','Current','Wave','Wind', '-mat')
+% save("../datas/Id.mat", 'Id')
