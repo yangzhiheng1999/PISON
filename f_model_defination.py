@@ -137,11 +137,12 @@ class Up(nn.Module):
         return self.dropout(x)
 
 class UNet(nn.Module):
-    def __init__(self, in_channels=2, out_channels=1, features=[16, 32, 64, 128], dropout_p=0.2, env_type=[]):
+    def __init__(self, in_channels=2, out_channels=1, features=[16, 32, 64, 128], dropout_p=0.2, env_type=[], is_residual=False):
         super().__init__()
         self.downs = nn.ModuleList()
         self.ups = nn.ModuleList()
         self.env_type = env_type
+        self.is_residual = is_residual
         # print(f'UNet env_type: {self.env_type}')
 
         in_ch = in_channels
@@ -184,6 +185,11 @@ class UNet(nn.Module):
 
         x = self.final_conv(x)
         x = self.final_norm(x)
+
+        # 是否属于残差训练阶段
+        if self.is_residual:
+            return x  # 残差阶段不激活
+
         if self.env_type == 'wave':
             return torch.sigmoid(x)  # 或 return x （若后续有归一化）
         else:
@@ -197,10 +203,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 
-scaler = GradScaler()  # 混合精度缩放器
+scaler = GradScaler("cuda")  # 混合精度缩放器
 
 # 训练函数
 def train_epoch(model, loader, criterion, optimizer, device):
@@ -211,7 +217,7 @@ def train_epoch(model, loader, criterion, optimizer, device):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
 
-        with autocast():  # 关键！
+        with autocast("cuda"):  # 关键！
             output = model(data)
             # 训练循环中，加权大值区域
             loss = criterion(output, target)
@@ -221,14 +227,13 @@ def train_epoch(model, loader, criterion, optimizer, device):
             print(f"Warning: NaN loss at batch {batch_idx}! Check gradients/data.")
             break
         
+        # 在 scaler step 之前加入梯度裁剪 (Unscale first)
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # 限制梯度最大范数
+        
         scaler.step(optimizer)
         scaler.update()
-
-        '''loss.backward()
-        # 梯度裁剪（防爆炸）
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()'''
         
         total_loss += loss.item()
         num_batches += 1
@@ -264,7 +269,8 @@ class UNetBoosting(nn.Module):
         self.env_type = env_type
         self.device = device
         for i in range(num_models):
-            model = UNet(in_channels=in_channels, out_channels=out_channels, features=features, env_type=self.env_type).to(self.device)
+            is_res = (i > 0)  # 第一个模型非残差，后续为残差
+            model = UNet(in_channels=in_channels, out_channels=out_channels, features=features, env_type=self.env_type, is_residual=is_res).to(self.device)
             # print(f'Env type for model {i}: {self.env_type}')
             model.apply(model.init_weights)  # 初始化
             optimizer = optim.Adam(model.parameters(), lr=learning_rate)  # 后续模型lr不缩小
