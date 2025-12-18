@@ -220,12 +220,12 @@ def train_epoch(model, loader, criterion, optimizer, device):
         with autocast("cuda"):  # 关键！
             output = model(data)
             # 训练循环中，加权大值区域
-            loss = criterion(output, target)
+            loss = criterion(output.float(), target.float())
 
         # NaN 监控
         if torch.isnan(loss):
             print(f"Warning: NaN loss at batch {batch_idx}! Check gradients/data.")
-            break
+            return float('inf')
         
         # 在 scaler step 之前加入梯度裁剪 (Unscale first)
         scaler.scale(loss).backward()
@@ -273,7 +273,7 @@ class UNetBoosting(nn.Module):
             model = UNet(in_channels=in_channels, out_channels=out_channels, features=features, env_type=self.env_type, is_residual=is_res).to(self.device)
             # print(f'Env type for model {i}: {self.env_type}')
             model.apply(model.init_weights)  # 初始化
-            optimizer = optim.Adam(model.parameters(), lr=learning_rate)  # 后续模型lr不缩小
+            optimizer = optim.Adam(model.parameters(), lr=learning_rate, eps=1e-4)  # 后续模型lr不缩小
             self.models.append(model)
             self.optimizers.append(optimizer)
     
@@ -282,6 +282,7 @@ class UNetBoosting(nn.Module):
         pred = self.models[0](x)
         for model in self.models[1:]:
             pred += self.shrinkage * model(x)
+            # pred += model(x)
         return pred
     
     def train_ensemble(self, train_loader, val_loader, criterion_1, scheduler_func, num_epochs=100, patience=7, device='cuda'):
@@ -342,6 +343,8 @@ class UNetBoosting(nn.Module):
             else:
                 train_res_dataset = TensorDataset(train_wind, current_train_res / self.shrinkage)
                 val_res_dataset = TensorDataset(val_wind, current_val_res / self.shrinkage)
+            '''train_res_dataset = TensorDataset(train_wind, current_train_res)
+            val_res_dataset = TensorDataset(val_wind, current_val_res)'''
 
             train_loader_res = DataLoader(train_res_dataset, batch_size=train_loader.batch_size, shuffle=True)
             val_loader_res = DataLoader(val_res_dataset, batch_size=val_loader.batch_size, shuffle=False)
@@ -349,6 +352,10 @@ class UNetBoosting(nn.Module):
             # 训练当前 U-Net
             for epoch in range(num_epochs):
                 train_loss = train_epoch(model, train_loader_res, criterion, optimizer, device)
+                # 如果遇到 NaN，直接跳过当前模型的剩余训练，尝试下一个模型（或者直接终止）
+                if train_loss == float('inf'):
+                    print(f"Skipping Model {i+1} due to NaN.")
+                    break
                 val_loss = val_epoch(model, val_loader_res, criterion, device)
                 scheduler.step(val_loss)
 
