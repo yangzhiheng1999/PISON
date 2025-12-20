@@ -397,3 +397,177 @@ class UNetBoosting(nn.Module):
                 batch_x = wind_tensor[i : i + batch_size].to(device)
                 preds.append(model(batch_x))
         return torch.cat(preds, dim=0)
+    
+
+# 二叉树结构 U-Net 的定义
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.amp import autocast
+from tqdm import tqdm
+import numpy as np
+
+# --- 保持原有的基础模块 (AttentionGate, DoubleConv, ResidualBlock, Down, Up, UNet) 不变 ---
+
+# === 新增：门控模块 (Gate Block) ===
+class GateBlock(nn.Module):
+    """
+    轻量级卷积网络，生成 0-1 之间的概率图 (Soft Routing)。
+    用于决定输入应该主要由左子树处理还是右子树处理。
+    """
+    def __init__(self, in_channels):
+        super(GateBlock, self).__init__()
+        self.gate = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.GELU(),
+            nn.Conv2d(16, 1, kernel_size=1), # 输出单通道概率图
+            nn.Sigmoid() # 关键：输出范围限制在 [0, 1]
+        )
+
+    def forward(self, x):
+        return self.gate(x)
+
+# === 修改：二叉树结构 U-Net (Tree Structured U-Net) ===
+class TreeUNet(nn.Module):
+    def __init__(self, depth, in_channels=2, out_channels=1, features=[16, 32, 64, 128], env_type=[], device='cuda'):
+        """
+        depth: 树的深度。depth=0 表示叶子节点（也就是一个 UNet）。
+               depth=2 意味着根节点下有左右两个子树，子树下又是叶子，共 4 个 UNet。
+        """
+        super(TreeUNet, self).__init__()
+        self.depth = depth
+        self.device = device
+        self.env_type = env_type
+        
+        # 如果深度为0，则是叶子节点（执行预测的 U-Net）
+        if self.depth == 0:
+            self.is_leaf = True
+            self.model = UNet(in_channels=in_channels, out_channels=out_channels, 
+                              features=features, env_type=env_type, is_residual=False).to(device)
+            self.model.apply(self.model.init_weights)
+        else:
+            # 否则是内部节点（包含门控和左右子树）
+            self.is_leaf = False
+            self.gate = GateBlock(in_channels).to(device)
+            
+            # 递归创建左右子树
+            self.left_child = TreeUNet(depth - 1, in_channels, out_channels, features, env_type, device)
+            self.right_child = TreeUNet(depth - 1, in_channels, out_channels, features, env_type, device)
+
+    def forward(self, x):
+        if self.is_leaf:
+            return self.model(x)
+        else:
+            # 计算路由概率图 (batch, 1, H, W)
+            prob_map = self.gate(x)
+            
+            # 递归获取左右子树的输出
+            left_out = self.left_child(x)
+            right_out = self.right_child(x)
+            
+            # 软路由聚合： Prob * Left + (1 - Prob) * Right
+            # 这种方式允许梯度在全树传播
+            return prob_map * left_out + (1 - prob_map) * right_out
+
+# === 训练逻辑适配 ===
+# 树形结构通常不再适合使用“残差逼近”的线性Boosting训练方式。
+# 它是端到端 (End-to-End) 的，所有专家网络和门控网络一起训练效果最好。
+
+class TreeUNetManager:
+    """
+    用于管理 TreeUNet 的训练和预测，替代原来的 UNetBoosting
+    """
+    def __init__(self, tree_depth=2, in_channels=2, out_channels=1, learning_rate=1e-3, 
+                 features=[16, 32, 64, 128], criterion = nn.MSELoss(),
+                 device='cuda', env_type=[]):
+        self.device = device
+        self.env_type = env_type
+        # depth=2 等同于 2^2 = 4 个 U-Net 叶子节点
+        self.tree_model = TreeUNet(depth=tree_depth, in_channels=in_channels, out_channels=out_channels, 
+                                   features=features, env_type=env_type, device=device).to(device)
+        
+        # 优化器优化整棵树的所有参数
+        self.optimizer = optim.Adam(self.tree_model.parameters(), lr=learning_rate, eps=1e-4)
+        
+        # 定义损失函数
+        self.criterion = criterion
+
+    def __call__(self, x):
+        return self.tree_model(x)
+
+    def train_tree(self, train_loader, val_loader, scheduler_func, num_epochs=100, patience=7):
+        """
+        端到端训练整棵树
+        """
+        scheduler = scheduler_func(self.optimizer)
+        best_val_loss = float('inf')
+        counter = 0
+        train_losses = []
+        val_losses = []
+
+        print(f"\nTraining Tree Structured U-Net (Depth={self.tree_model.depth})")
+        
+        for epoch in range(num_epochs):
+            # 1. 训练一个 Epoch
+            self.tree_model.train()
+            total_loss = 0
+            num_batches = 0
+            
+            for data, target in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+                data, target = data.to(self.device), target.to(self.device)
+                self.optimizer.zero_grad()
+
+                with autocast("cuda"):
+                    output = self.tree_model(data)
+                    loss = self.criterion(output, target)
+
+                if torch.isnan(loss):
+                    print("Error: NaN loss detected!")
+                    return train_losses, val_losses
+                
+                # 反向传播
+                scaler.scale(loss).backward()
+                scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.tree_model.parameters(), max_norm=1.0)
+                scaler.step(self.optimizer)
+                scaler.update()
+
+                total_loss += loss.item()
+                num_batches += 1
+            
+            avg_train_loss = total_loss / num_batches
+            
+            # 2. 验证
+            avg_val_loss = val_epoch(self.tree_model, val_loader, self.criterion, self.device)
+            scheduler.step(avg_val_loss)
+
+            print(f'Epoch {epoch+1}: Train Loss {avg_train_loss:.5f}, Val Loss {avg_val_loss:.5f}')
+            train_losses.append(avg_train_loss)
+            val_losses.append(avg_val_loss)
+
+            # 3. 早停策略
+            if avg_val_loss < best_val_loss - 1e-5:
+                best_val_loss = avg_val_loss
+                counter = 0
+                torch.save(self.tree_model.state_dict(), 'best_tree_unet_model.pth')
+            else:
+                counter += 1
+                if counter >= patience:
+                    print("Early stopping triggered.")
+                    break
+        
+        return train_losses, val_losses
+
+    def predict(self, x_tensor, batch_size=32):
+        """
+        批量预测辅助函数
+        """
+        self.tree_model.eval()
+        preds = []
+        total = len(x_tensor)
+        with torch.no_grad():
+            for i in range(0, total, batch_size):
+                batch_x = x_tensor[i : i + batch_size].to(self.device)
+                preds.append(self.tree_model(batch_x))
+        return torch.cat(preds, dim=0)
