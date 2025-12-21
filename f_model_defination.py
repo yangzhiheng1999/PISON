@@ -571,3 +571,246 @@ class TreeUNetManager:
                 batch_x = x_tensor[i : i + batch_size].to(self.device)
                 preds.append(self.tree_model(batch_x))
         return torch.cat(preds, dim=0)
+    
+
+
+# ==========================================
+#  XGBoost-like Gradient Boosting U-Net
+# ==========================================
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import gc  # 引入垃圾回收模块
+
+class XGBoostUNet(nn.Module):
+    def __init__(self, num_models=5, in_channels=2, out_channels=1, 
+                 features=[16, 32, 64, 128], 
+                 learning_rate=1e-3, 
+                 shrinkage=0.1, 
+                 subsample=0.8, 
+                 reg_lambda=1e-4, 
+                 device='cuda', 
+                 env_type='current'):
+        super(XGBoostUNet, self).__init__()
+        self.num_models = num_models
+        self.shrinkage = shrinkage
+        self.subsample = subsample
+        self.reg_lambda = reg_lambda
+        self.learning_rate = learning_rate # 保存 LR 供后续使用
+        self.features = features
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.env_type = env_type
+        self.device = device
+        
+        self.models = nn.ModuleList()
+        # 注意：这里不再预先创建 self.optimizers，因为优化器状态非常占显存
+        
+        # 初始化所有弱学习器 (Weak Learners)
+        for i in range(num_models):
+            is_res = (i > 0)
+            # 初始化时默认放在 CPU
+            model = UNet(in_channels=in_channels, out_channels=out_channels, 
+                         features=features, env_type=self.env_type, is_residual=is_res)
+            model.apply(model.init_weights)
+            self.models.append(model)
+
+    def forward(self, x):
+        # 推理逻辑：Base + eta * (Model1 + Model2 + ...)
+        # 自动获取输入数据所在的设备 (cuda 或 cpu)
+        current_device = x.device 
+        
+        # 处理第一个模型
+        model0 = self.models[0].to(current_device)
+        pred = model0(x)
+        # 如果不是在训练阶段，且为了极端节省显存，可以考虑 model0.to('cpu')
+        # 但如果是频繁预测，可以保持在 GPU，或者只在 batch 结束后处理
+        
+        for i in range(1, self.num_models):
+            model_i = self.models[i].to(current_device)
+            pred += self.shrinkage * model_i(x)
+            # 为了防止推理时显存溢出，计算完一个就放回 CPU
+            model_i.to('cpu') 
+            
+        return pred
+    
+    def compute_grad_hess(self, pred, target):
+        """
+        计算损失函数的一阶导 (Gradient) 和二阶导 (Hessian)。
+        XGBoost 的核心是拟合 -g/h。
+        """
+        if self.env_type == 'current' or self.env_type == 'default':
+            # MSE Loss: L = 0.5 * (y - p)^2
+            # Grad = p - y
+            # Hess = 1
+            grad = pred - target
+            hess = torch.ones_like(grad)
+            
+        elif self.env_type == 'wave' or self.env_type == 'surge':
+            # 为了数值稳定性，使用 Pseudo-Huber Loss 近似 L1
+            # L = delta^2 * (sqrt(1 + ((y-p)/delta)^2) - 1)
+            delta = 1.0 
+            diff = pred - target
+            scale = torch.sqrt(1 + (diff / delta) ** 2)
+            
+            grad = diff / scale
+            hess = (1 / scale) - (diff / scale)**2 / scale # 近似二阶导
+            
+        else:
+            # 默认回退到 MSE
+            grad = pred - target
+            hess = torch.ones_like(grad)
+            
+        return grad, hess
+
+    def train_ensemble(self, train_loader, val_loader, criterion_base, scheduler_func, num_epochs=100, patience=7):
+        train_losses = [[] for _ in range(self.num_models)]
+        val_losses = [[] for _ in range(self.num_models)]
+
+        # 1. 准备全量数据 Tensor (用于计算全局残差)
+        full_train_dataset = train_loader.dataset
+        full_val_dataset = val_loader.dataset
+        
+        # 假设 dataset 是 TensorDataset，直接获取；如果是自定义 Dataset，需修改此处获取逻辑
+        # 这里沿用原代码逻辑，提取 data
+        full_source_data = full_train_dataset.dataset # 原始 NumpyDataset
+        
+        # 提取训练集索引对应的数据
+        X_train = torch.from_numpy(full_source_data.wind_data[full_train_dataset.indices].astype(np.float32)).to(self.device)
+        y_train_np = full_source_data.output_data[full_train_dataset.indices].astype(np.float32)
+        if y_train_np.ndim == 3: y_train_np = np.expand_dims(y_train_np, 1)
+        y_train = torch.from_numpy(y_train_np).to(self.device)
+
+        X_val = torch.from_numpy(full_source_data.wind_data[full_val_dataset.indices].astype(np.float32)).to(self.device)
+        y_val_np = full_source_data.output_data[full_val_dataset.indices].astype(np.float32)
+        if y_val_np.ndim == 3: y_val_np = np.expand_dims(y_val_np, 1)
+        y_val = torch.from_numpy(y_val_np).to(self.device)
+
+        # 当前的累积预测 (Current Prediction)
+        pred_train_cumulative = torch.zeros_like(y_train)
+        pred_val_cumulative = torch.zeros_like(y_val)
+
+        # === 逐级训练 (Boosting Loop) ===
+        for i in range(self.num_models):
+            print(f"\n[XGBoost-UNet] Training Booster {i+1}/{self.num_models}")
+            model = self.models[i].to(self.device)
+            optimizer = optim.AdamW(model.parameters(), lr=self.learning_rate, weight_decay=self.reg_lambda)
+            scheduler = scheduler_func(optimizer)
+            
+            # --- 步骤 A: 准备当前阶段的目标 (Target) ---
+            if i == 0:
+                # 第一个模型直接拟合原始标签
+                train_target_step = y_train
+                val_target_step = y_val
+                # 第一个模型通常不需要复杂的 loss gradient，直接用 MSE 或 MAE 预热
+                criterion = criterion_base 
+            else:
+                # 后续模型拟合“负梯度” (Negative Gradient)
+                # XGBoost update: new_model ~= -grad / (hess + lambda)
+                # 在深度学习中，我们通常让网络输出去拟合这个目标
+                
+                with torch.no_grad():
+                    grad, hess = self.compute_grad_hess(pred_train_cumulative, y_train)
+                    # Newton Step: target = -grad / hess
+                    # 注意：如果 hess 很小，除法不稳定，所以 MSE (hess=1) 时其实就是 residual
+                    train_target_step = -grad / (hess + 1e-5) 
+                    
+                    # 验证集残差 (仅用于监控)
+                    grad_val, hess_val = self.compute_grad_hess(pred_val_cumulative, y_val)
+                    val_target_step = -grad_val / (hess_val + 1e-5)
+
+                    # 【显存优化】：计算完 target 后，grad 和 hess 就不需要了
+                    del grad, hess, grad_val, hess_val
+
+                # 弱学习器使用 MSE Loss 来逼近这个计算出的“最优更新步长”
+                criterion = nn.MSELoss()
+
+            # --- 步骤 B: 随机采样 (Subsampling) ---
+            # 创建本次训练的数据加载器
+            if self.subsample < 1.0 and i > 0: # Base model 建议用全量数据
+                num_samples = len(X_train)
+                indices = torch.randperm(num_samples)[:int(num_samples * self.subsample)]
+                train_sub_X = X_train[indices]
+                train_sub_y = train_target_step[indices]
+            else:
+                train_sub_X = X_train
+                train_sub_y = train_target_step
+
+            # 封装为 Loader
+            step_train_ds = TensorDataset(train_sub_X, train_sub_y)
+            step_val_ds = TensorDataset(X_val, val_target_step) # 验证集不采样
+            
+            step_train_loader = DataLoader(step_train_ds, batch_size=train_loader.batch_size, shuffle=True)
+            step_val_loader = DataLoader(step_val_ds, batch_size=val_loader.batch_size, shuffle=False)
+
+            # --- 步骤 C: 训练单个 U-Net ---
+            best_loss = float('inf')
+            counter = 0
+            
+            for epoch in range(num_epochs):
+                # 调用你现有的 train_epoch 函数
+                # 注意：这里的 optimizer 已经包含了 L2 正则 (lambda)
+                loss_train = train_epoch(model, step_train_loader, criterion, optimizer, self.device)
+                loss_val = val_epoch(model, step_val_loader, criterion, self.device)
+                
+                scheduler.step(loss_val)
+                train_losses[i].append(loss_train)
+                val_losses[i].append(loss_val)
+                
+                print(f"  Booster {i+1} Epoch {epoch+1}: Train {loss_train:.5f}, Val {loss_val:.5f}")
+
+                if loss_val < best_loss - 1e-5:
+                    best_loss = loss_val
+                    counter = 0
+                    torch.save(model.state_dict(), f'xgboost_unet_booster_{i}.pth')
+                else:
+                    counter += 1
+                    if counter >= patience:
+                        print(f"  Booster {i+1} Early stopping.")
+                        model.load_state_dict(torch.load(f'xgboost_unet_booster_{i}.pth'))
+                        break
+            
+            # --- 步骤 D: 更新全局预测 (Update Accumulation) ---
+            # 训练完后，使用该模型对全量数据进行预测，并更新累计预测值
+            model.eval()
+            with torch.no_grad():
+                # 批量预测以节省显存
+                new_pred_train = self._batch_predict(model, X_train, train_loader.batch_size)
+                new_pred_val = self._batch_predict(model, X_val, val_loader.batch_size)
+                
+                if i == 0:
+                    pred_train_cumulative = new_pred_train
+                    pred_val_cumulative = new_pred_val
+                else:
+                    pred_train_cumulative += self.shrinkage * new_pred_train
+                    pred_val_cumulative += self.shrinkage * new_pred_val
+
+            self.models[i].to('cpu') 
+            model.to('cpu') # 确保变量引用也指回 CPU
+            # B. 删除占用显存的临时变量
+            del optimizer        # 优化器状态（Momentum等）非常大，必须删
+            del scheduler
+            del step_train_loader
+            del step_val_loader
+            del train_target_step
+            del val_target_step
+            del new_pred_train
+            del new_pred_val
+            
+            # C. 强制执行垃圾回收和显存清空
+            gc.collect()                  # 清除 Python 层的无用引用
+            torch.cuda.empty_cache()      # 释放 PyTorch 缓存分配器中的显存
+            
+            print(f"  Booster {i+1} finished. GPU cache cleared.")
+
+        return train_losses, val_losses
+
+    def _batch_predict(self, model, x, batch_size):
+        preds = []
+        for i in range(0, len(x), batch_size):
+            batch = x[i:i+batch_size]
+            preds.append(model(batch))
+        return torch.cat(preds, dim=0)
