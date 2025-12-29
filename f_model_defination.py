@@ -805,8 +805,13 @@ class XGBoostUNet(nn.Module):
             torch.cuda.empty_cache()      # 释放 PyTorch 缓存分配器中的显存
             
             print(f"  Booster {i+1} finished. GPU cache cleared.")
+        
+        with torch.no_grad():
+            ensemble_val_loss = nn.MSELoss()(pred_val_cumulative, y_val).item()
+        
+        print(f"\n[XGBoost-UNet] Final Ensemble Val Loss: {ensemble_val_loss:.6f}")
 
-        return train_losses, val_losses
+        return train_losses, val_losses, ensemble_val_loss
 
     def _batch_predict(self, model, x, batch_size):
         preds = []
