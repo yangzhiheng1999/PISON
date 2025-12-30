@@ -213,7 +213,8 @@ def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
     total_loss = 0
     num_batches = 0
-    for batch_idx, (data, target) in enumerate(tqdm(loader)):
+    # for batch_idx, (data, target) in enumerate(tqdm(loader)):
+    for batch_idx, (data, target) in enumerate(loader):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
 
