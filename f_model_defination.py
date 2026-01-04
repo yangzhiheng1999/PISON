@@ -203,10 +203,10 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import torch.optim as optim
-from torch.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
-scaler = GradScaler("cuda")  # 混合精度缩放器
+scaler = GradScaler()  # 混合精度缩放器
 
 # 训练函数
 def train_epoch(model, loader, criterion, optimizer, device):
@@ -218,7 +218,7 @@ def train_epoch(model, loader, criterion, optimizer, device):
         data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
 
-        with autocast("cuda"):  # 关键！
+        with autocast():  # 关键！
             output = model(data)
             # 训练循环中，加权大值区域
             loss = criterion(output.float(), target.float())
@@ -404,7 +404,7 @@ class UNetBoosting(nn.Module):
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.amp import autocast
+from torch.cuda.amp import autocast
 from tqdm import tqdm
 import numpy as np
 
@@ -519,7 +519,7 @@ class TreeUNetManager:
                 data, target = data.to(self.device), target.to(self.device)
                 self.optimizer.zero_grad()
 
-                with autocast("cuda"):
+                with autocast():
                     output = self.tree_model(data)
                     loss = self.criterion(output, target)
 
