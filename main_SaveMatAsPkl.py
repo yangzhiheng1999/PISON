@@ -9,13 +9,13 @@ if __name__=="__main__":
 
     # 数据文件句柄
     # typhoon_handler = c_PickleHandler('../datas/typhoon_piled.pkl')
-    surge_handler = c_PickleHandler('../datas/surge_2d.pkl')
-    current_handler = c_PickleHandler('../datas/current_2d.pkl')
-    wave_handler = c_PickleHandler('../datas/wave_2d.pkl')
-    wind_handler = c_PickleHandler('../datas/wind_2d.pkl')
+    # surge_handler = c_PickleHandler('../datas/surge_2d.pkl')
+    # current_handler = c_PickleHandler('../datas/current_2d.pkl')
+    wave_handler = c_PickleHandler('../datas/wave_screen_2d.pkl')
+    wind_handler = c_PickleHandler('../datas/wind_screen_2d.pkl')
 
     # 将读取出的数据堆叠起来
-    print('**proccessing surge data')
+    '''print('**proccessing surge data')
     Surge = f_ReadCellMat('../datas/Environment_64.mat', 'Surge')
     print('piling surge ...')
     surge_piled = f_PileMatrix(Surge)
@@ -42,13 +42,14 @@ if __name__=="__main__":
     del current_2d
     del current_piled
     del Current
-    gc.collect()
+    gc.collect()'''
 
 
     print('**proccessing wave data')
-    Wave = f_ReadCellMat('../datas/Environment_64.mat', 'Wave')
+    Wave = f_ReadCellMat("G:/20251014PINN/datas/Environment_64_segs.mat", 'Wave')
     print('piling wave ...')
     wave_piled = f_PileMatrix(Wave)
+    N_time = wave_piled.shape[0]
     print('reshaping piled wave data ...')
     wave_2d = wave_piled.reshape(N_time, 64, 64).transpose(0, 2, 1)
     print('saving wave data ...')
@@ -61,9 +62,10 @@ if __name__=="__main__":
 
 
     print('**proccessing wind data')
-    Wind = f_ReadCellMat('../datas/Environment_64.mat', 'Wind')
+    Wind = f_ReadCellMat("G:/20251014PINN/datas/Environment_64_segs.mat", 'Wind')
     print('piling wind ...')
     wind_piled = f_PileMatrix(Wind)
+    N_time = wind_piled.shape[0]
     print('reshaping piled wind data ...')
     wind_2d = wind_piled.reshape(N_time, 64, 64).transpose(0, 2, 1)
     print('saving wind data ...')

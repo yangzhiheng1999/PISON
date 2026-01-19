@@ -209,7 +209,7 @@ from tqdm import tqdm
 scaler = GradScaler()  # 混合精度缩放器
 
 # 训练函数
-def train_epoch(model, loader, criterion, optimizer, device):
+'''def train_epoch(model, loader, criterion, optimizer, device):
     model.train()
     total_loss = 0
     num_batches = 0
@@ -239,7 +239,50 @@ def train_epoch(model, loader, criterion, optimizer, device):
         total_loss += loss.item()
         num_batches += 1
         
-    return total_loss / num_batches if num_batches > 0 else float('inf')
+    return total_loss / num_batches if num_batches > 0 else float('inf')'''
+
+# 修改后的 train_epoch (位于 f_model_defination.py)
+def train_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0
+    num_batches = 0
+    
+    # 移除 scaler，因为我们不再使用 AMP
+    # scaler = GradScaler() # 如果是在函数外定义的，这里不需要；如果是函数内，请注释掉
+    
+#     for batch_idx, (data, target) in enumerate(tqdm(loader)):
+    for batch_idx, (data, target) in enumerate(loader):
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+
+        # === 修改点 1: 移除 autocast 上下文 ===
+        # with autocast(): 
+        output = model(data)
+        loss = criterion(output, target) # 不需要 .float()，默认就是 float32
+
+        # === 修改点 2: 增强 NaN/Inf 检查 ===
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: NaN/Inf loss at batch {batch_idx}!")
+            # 遇到 NaN 跳过该 batch，避免破坏权重
+            continue 
+        
+        # === 修改点 3: 标准的反向传播 ===
+        loss.backward()
+        
+        # 梯度裁剪（强烈建议保留）
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
+        
+        optimizer.step()
+        # scaler.step(optimizer) # 移除
+        # scaler.update()        # 移除
+        
+        total_loss += loss.item()
+        num_batches += 1
+        
+    if num_batches == 0:
+        return float('inf')
+        
+    return total_loss / num_batches
 
 # 验证函数
 def val_epoch(model, loader, criterion, device):
